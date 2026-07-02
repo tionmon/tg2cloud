@@ -1,0 +1,23 @@
+services:
+  backend:
+    build: ./backend
+    container_name: tg2cloud-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "127.0.0.1:51947:51947"
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:51947}
+    container_name: tg2cloud-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "127.0.0.1:47832:80"
