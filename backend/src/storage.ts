@@ -2,8 +2,8 @@ import fs from 'fs';
 import fsp from 'fs/promises';
 import path from 'path';
 import axios from 'axios';
-import { UPLOAD_DIR } from './config.js';
-import type { DropboxSettings, StorageProviderName } from './store.js';
+import { GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, UPLOAD_DIR } from './config.js';
+import type { DropboxSettings, GoogleDriveSettings, StorageProviderName } from './store.js';
 
 export interface StorageProvider {
   name: StorageProviderName;
@@ -215,10 +215,165 @@ export class DropboxStorageProvider implements StorageProvider {
   }
 }
 
-export function createProvider(name: StorageProviderName, dropbox?: DropboxSettings): StorageProvider {
+type GoogleTokenResponse = {
+  access_token: string;
+  expires_in?: number;
+  refresh_token?: string;
+};
+
+export class GoogleDriveStorageProvider implements StorageProvider {
+  name: StorageProviderName = 'google-drive';
+  private accessToken: string | null = null;
+  private tokenExpiresAt = 0;
+
+  constructor(private settings: GoogleDriveSettings) {}
+
+  static isConfigured(): boolean {
+    return Boolean(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET);
+  }
+
+  static generateAuthUrl(redirectUri: string, state: string): string {
+    if (!this.isConfigured()) throw new Error('Google OAuth 未配置');
+    const params = new URLSearchParams({
+      client_id: GOOGLE_CLIENT_ID,
+      redirect_uri: redirectUri,
+      response_type: 'code',
+      access_type: 'offline',
+      prompt: 'consent',
+      include_granted_scopes: 'true',
+      scope: ['openid', 'email', 'https://www.googleapis.com/auth/drive.file'].join(' '),
+      state,
+    });
+    return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+  }
+
+  static async exchangeCode(redirectUri: string, code: string): Promise<GoogleTokenResponse> {
+    if (!this.isConfigured()) throw new Error('Google OAuth 未配置');
+    const params = new URLSearchParams({
+      client_id: GOOGLE_CLIENT_ID,
+      client_secret: GOOGLE_CLIENT_SECRET,
+      redirect_uri: redirectUri,
+      code,
+      grant_type: 'authorization_code',
+    });
+    const response = await axios.post<GoogleTokenResponse>('https://oauth2.googleapis.com/token', params.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: 30000,
+    });
+    return response.data;
+  }
+
+  static async getAccountName(accessToken: string): Promise<string> {
+    const response = await axios.get('https://www.googleapis.com/drive/v3/about?fields=user(displayName,emailAddress)', {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      timeout: 30000,
+    });
+    return response.data.user?.emailAddress || response.data.user?.displayName || 'Google Drive Account';
+  }
+
+  private async getAccessToken(): Promise<string> {
+    if (this.accessToken && Date.now() < this.tokenExpiresAt - 300000) return this.accessToken;
+    if (!GoogleDriveStorageProvider.isConfigured()) {
+      throw new Error('Google OAuth 未配置，请设置 GOOGLE_CLIENT_ID 和 GOOGLE_CLIENT_SECRET');
+    }
+
+    const params = new URLSearchParams({
+      client_id: GOOGLE_CLIENT_ID,
+      client_secret: GOOGLE_CLIENT_SECRET,
+      refresh_token: this.settings.refreshToken,
+      grant_type: 'refresh_token',
+    });
+    const response = await axios.post<GoogleTokenResponse>('https://oauth2.googleapis.com/token', params.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: 30000,
+    });
+    this.accessToken = response.data.access_token;
+    this.tokenExpiresAt = Date.now() + ((response.data.expires_in || 3600) * 1000);
+    return this.accessToken!;
+  }
+
+  private async ensureRootFolder(token: string): Promise<string> {
+    const query = "name = 'tg2cloud' and mimeType = 'application/vnd.google-apps.folder' and trashed = false";
+    const existing = await axios.get('https://www.googleapis.com/drive/v3/files', {
+      headers: { Authorization: `Bearer ${token}` },
+      params: { q: query, spaces: 'drive', pageSize: 1, fields: 'files(id)' },
+      timeout: 30000,
+    });
+    const folderId = existing.data.files?.[0]?.id;
+    if (folderId) return folderId;
+
+    const created = await axios.post('https://www.googleapis.com/drive/v3/files?fields=id', {
+      name: 'tg2cloud',
+      mimeType: 'application/vnd.google-apps.folder',
+    }, {
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      timeout: 30000,
+    });
+    return created.data.id;
+  }
+
+  async saveFile(tempPath: string, storedName: string, mimeType: string): Promise<string> {
+    const token = await this.getAccessToken();
+    const folderId = await this.ensureRootFolder(token);
+    const stat = await fsp.stat(tempPath);
+    const session = await axios.post('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id', {
+      name: storedName,
+      parents: [folderId],
+    }, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json; charset=UTF-8',
+        'X-Upload-Content-Type': mimeType,
+        'X-Upload-Content-Length': String(stat.size),
+      },
+      timeout: 30000,
+    });
+    const uploadUrl = session.headers.location;
+    if (!uploadUrl) throw new Error('Google Drive 未返回上传地址');
+
+    const uploaded = await axios.put(uploadUrl, fs.createReadStream(tempPath), {
+      headers: { 'Content-Type': mimeType, 'Content-Length': String(stat.size) },
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+      timeout: 600000,
+    });
+    if (!uploaded.data.id) throw new Error('Google Drive 上传失败：未返回文件 ID');
+    return uploaded.data.id;
+  }
+
+  async getFileStream(fileId: string): Promise<NodeJS.ReadableStream> {
+    const token = await this.getAccessToken();
+    const response = await axios.get(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`, {
+      headers: { Authorization: `Bearer ${token}` },
+      responseType: 'stream',
+      timeout: 60000,
+    });
+    return response.data;
+  }
+
+  async getPreviewUrl(fileId: string): Promise<string> {
+    return `https://drive.google.com/file/d/${encodeURIComponent(fileId)}/view`;
+  }
+
+  async deleteFile(fileId: string): Promise<void> {
+    const token = await this.getAccessToken();
+    await axios.delete(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+      timeout: 30000,
+    }).catch(error => {
+      if (error.response?.status !== 404) throw error;
+    });
+  }
+}
+
+export function createProvider(name: StorageProviderName, dropbox?: DropboxSettings, googleDrive?: GoogleDriveSettings): StorageProvider {
   if (name === 'dropbox') {
     if (!dropbox?.refreshToken) throw new Error('Dropbox 未配置');
     return new DropboxStorageProvider(dropbox);
+  }
+  if (name === 'google-drive') {
+    if (!googleDrive?.refreshToken) throw new Error('Google Drive 未连接');
+    return new GoogleDriveStorageProvider(googleDrive);
   }
   return new LocalStorageProvider();
 }

@@ -10,6 +10,7 @@ frontend/dist/
 backend/dist/
 .vite/
 .cache/
+*.tsbuildinfo
 
 # env / secrets
 .env

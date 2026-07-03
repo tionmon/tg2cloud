@@ -1,0 +1,5 @@
+*.sh text eol=lf
+backend/Dockerfile text eol=lf
+frontend/Dockerfile text eol=lf
+backend/.dockerignore text eol=lf
+frontend/.dockerignore text eol=lf
